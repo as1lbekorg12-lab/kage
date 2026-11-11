@@ -4,4 +4,3 @@ aiosqlite==0.22.1
 asyncpg==0.32.0
 python-dotenv==1.2.2
 SQLAlchemy[asyncio]==2.1.6
-tzdata

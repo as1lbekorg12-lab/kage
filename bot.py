@@ -19,6 +19,8 @@ Muhit o'zgaruvchilari (Render → Environment yoki lokal .env fayl):
     ADMIN_IDS            ixtiyoriy, vergul bilan
     BOT_NAME / BOT_USERNAME / TIMEZONE   ixtiyoriy (Kage Dub / Kage_Dub_bot / Asia/Tashkent)
     BASE_URL             bo'sh qoldiring: Render RENDER_EXTERNAL_URL ni o'zi beradi -> webhook rejimi
+    AI_API_KEY           Anthropic API kaliti (AI yordamchi uchun; bo'sh bo'lsa AI o'chiq)
+    AI_MODEL             ixtiyoriy (standart: claude-haiku-5-5)
     PYTHON_VERSION       3.12.3  (faqat Render'da)
 
 Render: Build `pip install -r requirements.txt` | Start `python main.py` | Health Check Path `/health`
@@ -32,13 +34,17 @@ Fayl tuzilishi (yuqoridan pastga, tartibni o'zgartirmang):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html
+import io
 import json
 import logging
 import os
 import re
 import time
+
+import aiohttp
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
@@ -162,6 +168,19 @@ TEXTS: dict[str, dict[str, str]] = {
         "ep_prev": "⏮ Oldingi",
         "ep_next": "Keyingi ⏭",
         "watch_btn": "▶️ Tomosha qilish",
+        "btn_ai": "🤖 AI yordamchi",
+        "ai_welcome": (
+            "🤖 <b>AI yordamchi</b>\n\n"
+            "Men sizga yordam beraman:\n"
+            "📸 Anime <b>rasmini</b> yuboring, nomini aytaman\n"
+            "🎭 Janr yoki tavsif yozing, mos anime topaman\n"
+            "💬 Bot haqida istalgan savol bering\n\n"
+            "Savolingizni yozing 👇"
+        ),
+        "ai_off": "⚠️ AI yordamchi hozircha o'chiq.",
+        "ai_limit": "⏳ Juda tez yozyapsiz. Bir daqiqadan so'ng urinib ko'ring.",
+        "ai_error": "⚠️ AI hozir javob bera olmadi. Birozdan so'ng urinib ko'ring.",
+        "ai_exit": "🚪 AI dan chiqish",
     },
     "ru": {
         "choose_lang": "🌐 <b>Tilni tanlang</b>\nВыберите язык",
@@ -251,6 +270,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "ep_prev": "⏮ Назад",
         "ep_next": "Далее ⏭",
         "watch_btn": "▶️ Смотреть",
+        "btn_ai": "🤖 AI помощник",
+        "ai_welcome": (
+            "🤖 <b>AI помощник</b>\n\n"
+            "📸 Отправьте <b>картинку</b> аниме, и я назову его\n"
+            "🎭 Напишите жанр или описание, и я найду аниме\n"
+            "💬 Задайте любой вопрос о боте\n\n"
+            "Напишите ваш вопрос 👇"
+        ),
+        "ai_off": "⚠️ AI помощник пока отключён.",
+        "ai_limit": "⏳ Слишком быстро. Попробуйте через минуту.",
+        "ai_error": "⚠️ AI сейчас не смог ответить. Попробуйте позже.",
+        "ai_exit": "🚪 Выйти из AI",
     },
 }
 
@@ -277,7 +308,7 @@ def variants(key: str) -> set[str]:
 
 # Menyu tugmalari matnlari: to'lov chekini kutayotgan holatda ham ishlashi uchun kerak
 MENU_TEXTS = (variants("btn_animes") | variants("btn_search") | variants("btn_genres")
-              | variants("btn_fav") | variants("btn_lang"))
+              | variants("btn_fav") | variants("btn_lang") | variants("btn_ai"))
 
 _bg_tasks: set[asyncio.Task] = set()
 
@@ -337,6 +368,8 @@ class Config:
     webhook_secret: str
     port: int
     timezone: str
+    ai_api_key: str
+    ai_model: str
 
 
 @lru_cache(maxsize=1)
@@ -363,6 +396,8 @@ def get_config() -> Config:
         webhook_secret=secret,
         port=int(os.getenv("PORT", "8080")),
         timezone=os.getenv("TIMEZONE", "Asia/Tashkent").strip(),
+        ai_api_key=os.getenv("AI_API_KEY", "").strip(),
+        ai_model=os.getenv("AI_MODEL", "claude-haiku-5-5").strip(),
     )
 
 
@@ -1255,6 +1290,10 @@ class SearchSt(StatesGroup):
     query = State()
 
 
+class AiSt(StatesGroup):
+    chat = State()
+
+
 class VipPay(StatesGroup):
     receipt = State()
 
@@ -1452,6 +1491,7 @@ def main_menu(lang: str, staff: bool) -> ReplyKeyboardMarkup:
            KeyboardButton(text=t(lang, "btn_search"), style="primary"))
     kb.row(KeyboardButton(text=t(lang, "btn_genres"), style="primary"),
            KeyboardButton(text=t(lang, "btn_fav"), style="primary"))
+    kb.row(KeyboardButton(text=t(lang, "btn_ai"), style="success"))
     kb.row(KeyboardButton(text=t(lang, "btn_vip"), style="success"),
            KeyboardButton(text=t(lang, "btn_lang")))
     if staff:
@@ -2202,10 +2242,13 @@ async def cb_fav_toggle(cb: CallbackQuery) -> None:
 
 
 # ───────────────────────────── Qidiruv ─────────────────────────────
-async def do_search(message: Message, query: str) -> None:
+async def do_search(message: Message, query: str, ai_fallback: bool = False) -> None:
     lang = lang_of(message.from_user.id)
     results = await repo.search_anime(query, limit=10)
     if not results:
+        if ai_fallback and ai_enabled():
+            await run_ai(message, message.bot, text=query)
+            return
         await message.answer(t(lang, "search_none"))
         return
     if len(results) == 1 and query.strip().isdigit():
@@ -2299,10 +2342,10 @@ async def cb_episode_page(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-# ───────────────────────────── Oddiy matn = qidiruv ─────────────────────────────
+# ───────────────────────────── Oddiy matn = qidiruv (topilmasa AI) ─────────────────────────────
 @fallback_router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def free_text_search(message: Message) -> None:
-    await do_search(message, message.text)
+    await do_search(message, message.text, ai_fallback=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2520,6 +2563,166 @@ async def pay_ok(cb: CallbackQuery, bot: Bot) -> None:
 @vip_router.callback_query(F.data.startswith("payno:"), IsOwner())
 async def pay_no(cb: CallbackQuery, bot: Bot) -> None:
     await _finish_payment(cb, bot, False)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: AI YORDAMCHI
+# ════════════════════════════════════════════════════════════════════════════
+
+ai_router = Router(name="ai")
+
+AI_URL = "https://api.anthropic.com/v1/messages"
+AI_PER_MINUTE = 8
+_ai_hits: dict[int, list[float]] = {}
+
+
+def ai_enabled() -> bool:
+    return bool(get_config().ai_api_key)
+
+
+def ai_allowed(uid: int) -> bool:
+    now = time.monotonic()
+    hits = [h for h in _ai_hits.get(uid, []) if now - h < 60]
+    if len(hits) >= AI_PER_MINUTE:
+        _ai_hits[uid] = hits
+        return False
+    hits.append(now)
+    _ai_hits[uid] = hits
+    return True
+
+
+async def ai_call(system: str, content: list[dict], max_tokens: int = 800) -> str | None:
+    cfg = get_config()
+    payload = {
+        "model": cfg.ai_model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": content}],
+    }
+    headers = {
+        "x-api-key": cfg.ai_api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=45)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(AI_URL, json=payload, headers=headers) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    logger.warning("AI xatosi %s: %s", resp.status, str(data)[:300])
+                    return None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        logger.warning("AI so'rovi amalga oshmadi: %s", exc)
+        return None
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+
+async def build_ai_system(lang: str) -> str:
+    items = await repo.list_anime(0, 300)
+    genres = await repo.list_genres()
+    catalog = "\n".join(
+        f"{a.id}|{a.title}|{', '.join(g.name for g in a.genres)}|{'VIP' if a.is_vip else ''}" for a in items
+    ) or "(hozircha anime yo'q)"
+    plans = "; ".join(f"{p['title']} — {fmt_money(p['price'])} so'm ({p['days']} kun)" for p in get_plans())
+    cfg = get_config()
+    return f"""Sen "{cfg.bot_name}" (@{bot_username()}) anime Telegram botining yordamchisisan.
+Foydalanuvchi tili: {'o‘zbek' if lang == 'uz' else 'rus'} — shu tilda, qisqa va do'stona javob ber (emoji ishlatishing mumkin).
+
+BOT HAQIDA:
+- Bot o'zbek tilida dublyaj qilingan animelarni ko'rsatadi. Menyu: Animelar (ro'yxat), Qidiruv (nom, kod yoki janr), Janrlar, Sevimlilar, VIP, Til, AI yordamchi.
+- Anime sahifasida qism raqamlari tugma bo'lib turadi; bosilsa video keladi, keyingi/oldingi qism tugmalari bor.
+- Anime kodini yozib ham topsa bo'ladi. Sevimlilarga ⭐ tugmasi orqali qo'shiladi.
+- 💎 VIP belgisi bor animelarni faqat VIP foydalanuvchilar ko'ra oladi.
+- VIP tariflari: {plans}.
+- VIP olish: menyudan 💎 VIP → tarif tanlash → kartaga to'lab, chek rasmini yuborish → administrator tasdiqlagach VIP faollashadi.
+- Botdan foydalanish uchun majburiy kanallarga obuna bo'lish kerak, so'ng «Tekshirish» bosiladi.
+- Videolarni ko'chirib yoki forward qilib bo'lmaydi (himoyalangan).
+- Tilni 🌐 Til tugmasi orqali o'zgartirsa bo'ladi (o'zbek/rus).
+Bu ro'yxatda yo'q narsani o'ylab topma; bilmasang "administratorga murojaat qiling" de.
+
+JANRLAR: {', '.join(g.name for g in genres) or '—'}
+
+ANIME KATALOGI (id|nom|janrlar|VIP):
+{catalog}
+
+QOIDALAR:
+- Anime tavsiya qilganda FAQAT katalogdagi animelarni ayt, id sini anime_ids ga yoz (ko'pi bilan 6 ta). Katalogda yo'q animeni "bizda bor" dema.
+- Rasm kelsa: rasmdagi anime nomini aniqla va answer ichida nomini ayt. Agar katalogda bo'lsa, id sini anime_ids ga yoz; bo'lmasa, bizda hozircha yo'qligini ayt. Rasm animega o'xshamasa yoki aniq bilmasang, shuni ochiq ayt, taxmin qilib yolg'on aytma.
+- Anime bilan bog'liq bo'lmagan, bot yoki animega aloqasiz savollarga muloyimlik bilan rad javobini ber.
+- Javobni FAQAT shu JSON ko'rinishida qaytar, boshqa hech narsa yozma:
+{{"answer": "matn", "anime_ids": [1, 2]}}"""
+
+
+def parse_ai_json(text: str) -> tuple[str, list[int]]:
+    match = re.search(r"\{.*\}", text, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            ids = [int(x) for x in data.get("anime_ids", []) if str(x).isdigit()]
+            return str(data.get("answer", "")).strip(), ids
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return text.strip(), []
+
+
+async def run_ai(message: Message, bot: Bot, text: str | None = None, photo: bool = False) -> None:
+    uid = message.from_user.id
+    lang = lang_of(uid)
+    if not ai_enabled():
+        await message.answer(t(lang, "ai_off"))
+        return
+    if not ai_allowed(uid):
+        await message.answer(t(lang, "ai_limit"))
+        return
+    await bot.send_chat_action(message.chat.id, "typing")
+
+    content: list[dict] = []
+    question = text or ""
+    if photo:
+        buf = io.BytesIO()
+        await bot.download(message.photo[-1], destination=buf)
+        content.append({"type": "image", "source": {
+            "type": "base64", "media_type": "image/jpeg",
+            "data": base64.b64encode(buf.getvalue()).decode()}})
+        question = message.caption or "Bu qaysi anime?"
+    content.append({"type": "text", "text": question[:1500]})
+
+    raw = await ai_call(await build_ai_system(lang), content)
+    if not raw:
+        await message.answer(t(lang, "ai_error"))
+        return
+    answer, ids = parse_ai_json(raw)
+
+    rows = []
+    for aid in ids[:6]:
+        anime = await repo.get_anime(aid)
+        if anime:
+            rows.append([B(anime_label(anime), f"an:{anime.id}")])
+    rows.append([B(t(lang, "ai_exit"), "cancel", style="danger")])
+    await message.answer(esc(short(answer, 3500)) or t(lang, "ai_error"), reply_markup=markup(rows))
+
+
+@ai_router.message(F.text.in_(variants("btn_ai")))
+async def menu_ai(message: Message, state: FSMContext) -> None:
+    lang = lang_of(message.from_user.id)
+    await state.clear()
+    if not ai_enabled():
+        await message.answer(t(lang, "ai_off"))
+        return
+    await state.set_state(AiSt.chat)
+    await message.answer(t(lang, "ai_welcome"),
+                         reply_markup=markup([[B(t(lang, "ai_exit"), "cancel", style="danger")]]))
+
+
+@ai_router.message(AiSt.chat, F.text, ~F.text.startswith("/"))
+async def ai_text(message: Message, bot: Bot) -> None:
+    await run_ai(message, bot, text=message.text)
+
+
+@ai_router.message(StateFilter(None, AiSt.chat), F.photo)
+async def ai_photo(message: Message, bot: Bot) -> None:
+    await run_ai(message, bot, photo=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3920,6 +4123,7 @@ def get_routers() -> list[Router]:
         anime_router,
         channels_router,
         owners_router,
+        ai_router,
         fallback_router,  # doim eng oxirida (oddiy matn = qidiruv)
     ]
 
@@ -3947,8 +4151,9 @@ async def load_cache(bot: Bot, cfg: Config) -> None:
 
     me = await bot.get_me()
     cache.bot_username = me.username or cfg.bot_username
-    logger.info("Bot: @%s | foydalanuvchilar: %s | adminlar: %s",
-                cache.bot_username, len(cache.known), len(cache.admins))
+    logger.info("Bot: @%s | foydalanuvchilar: %s | adminlar: %s | AI: %s",
+                cache.bot_username, len(cache.known), len(cache.admins),
+                "yoqilgan" if cfg.ai_api_key else "o'chiq")
 
     await _seed_default_channel(bot, cfg)
     await refresh_channels()
